@@ -6,6 +6,7 @@ bot.py — Telegram Bot with full panel UI and extended admin controls.
 - Message sequence addition via direct message forwarding.
 - Test sequence preview.
 - Approve All Requests now available to admins/subadmins with permission.
+- Broadcast runs in background with instant confirmation.
 """
 
 import asyncio
@@ -46,7 +47,6 @@ BOT_TOKEN:       str = os.getenv("BOT_TOKEN", "")
 SOURCE_CHAT_ID:  int = int(os.getenv("SOURCE_CHAT_ID", "0"))
 ADMIN_ID:        int = int(os.getenv("ADMIN_ID", "0"))
 
-BROADCAST_DELAY: float = 0.5
 MAX_RETRIES:     int   = 2
 DB_PATH:         str   = "bot.db"
 
@@ -251,7 +251,7 @@ PERMISSIONS = [
     "can_manage_subadmins",
     "can_manage_bot_profile",
     "can_test_sequence",
-    "can_approve_requests",   # NEW
+    "can_approve_requests",
 ]
 
 PERM_DISPLAY = {
@@ -263,7 +263,7 @@ PERM_DISPLAY = {
     "can_manage_subadmins": "👥 Manage Subadmins",
     "can_manage_bot_profile": "🤖 Bot Profile",
     "can_test_sequence": "🧪 Test Sequence",
-    "can_approve_requests": "✅ Approve All Requests",   # NEW
+    "can_approve_requests": "✅ Approve All Requests",
 }
 
 def db_get_subadmin_perms(user_id: int) -> dict:
@@ -538,7 +538,6 @@ async def send_sequence_to_user(bot, user_id: int):
             break
         except TelegramError as e:
             logger.error("Sequence error msg %s → user %s: %s", row["message_id"], user_id, e)
-        await asyncio.sleep(BROADCAST_DELAY)
 
     post = await run(db_get_post_sequence)
     if post.get("message_text"):
@@ -572,7 +571,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await open_panel(update, user.id)
         return
 
-    # Regular user: no sequence here (only on join request)
     await update.message.reply_text(
         "👋 Hello! This bot will send you content when you request to join a channel."
     )
@@ -593,7 +591,6 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await run(db_upsert_user, user.id)
     await send_sequence_to_user(context.bot, user.id)
 
-    # Auto‑approve if enabled
     if await run(db_get_auto_approve):
         try:
             await context.bot.approve_chat_join_request(chat_id=jr.chat.id, user_id=user.id)
@@ -645,10 +642,11 @@ async def cb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ══════════════════════════════════════════════
-# BROADCAST HELPER
+# BROADCAST (Background, No Delay, Instant Reply)
 # ══════════════════════════════════════════════
 
 async def do_broadcast(source_msg, bot, text: str = None) -> tuple:
+    """Actual broadcast worker; runs in background."""
     sent = blocked = failed = 0
     for uid in await run(db_all_user_ids):
         for attempt in range(MAX_RETRIES + 1):
@@ -664,7 +662,7 @@ async def do_broadcast(source_msg, bot, text: str = None) -> tuple:
                 break
             except TelegramError as e:
                 if attempt < MAX_RETRIES:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(1)   # only for retry backoff
                 else:
                     logger.warning("Broadcast failed for %s: %s", uid, e)
                     failed += 1
@@ -672,8 +670,13 @@ async def do_broadcast(source_msg, bot, text: str = None) -> tuple:
                 logger.exception("Unexpected error for %s: %s", uid, e)
                 failed += 1
                 break
-        await asyncio.sleep(BROADCAST_DELAY)
+    logger.info("Broadcast finished: sent=%s blocked=%s failed=%s", sent, blocked, failed)
     return sent, blocked, failed
+
+
+async def background_broadcast(source_msg, bot, text: str = None):
+    """Wrapper to run broadcast in background and log result."""
+    await do_broadcast(source_msg, bot, text)
 
 
 # ══════════════════════════════════════════════
@@ -789,7 +792,6 @@ async def perm_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     new_val = not perms[perm]
     await run(db_set_subadmin_perm, sub_id, perm, new_val)
 
-    # Refresh the menu
     perms = await run(db_get_subadmin_perms, sub_id)
     role = await run(db_get_admin_role, sub_id)
     keyboard = []
@@ -832,7 +834,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     uid   = user.id
     text  = (msg.text or msg.caption or "").strip()
 
-    # Forward non‑admin messages to admins
     if not is_any_admin(uid):
         await forward_to_admins(update, context)
         return
@@ -853,12 +854,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await open_panel(update, uid, "⛔ You don't have permission to broadcast.")
             return
         await run(db_clear_state, uid)
-        status = await msg.reply_text("📤 Broadcasting…")
-        sent, blocked, failed = await do_broadcast(msg, context.bot)
-        total = sent + blocked + failed
-        await status.edit_text(
-            "✅ Broadcast done — sent to all users successfully.",
-        )
+
+        # Start background broadcast and reply instantly
+        asyncio.create_task(background_broadcast(msg, context.bot))
+        await msg.reply_text("✅ Broadcast done.")
         await open_panel(update, uid)
         return
 
@@ -970,7 +969,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
 
         source_id = await run(db_get_source_chat_id)
-        # Forward the message to the source channel
         try:
             sent_msg = await msg.forward(chat_id=source_id)
             message_id = sent_msg.message_id
@@ -1282,7 +1280,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 approved += 1
             except Exception as e:
                 logger.error("Failed to approve %s in %s: %s", req["user_id"], req["chat_id"], e)
-            await asyncio.sleep(0.1)
         await run(db_clear_pending_requests)
         await status.edit_text(f"✅ Approved {approved} out of {len(pending)} requests.")
         await open_panel(update, uid)
@@ -1536,7 +1533,6 @@ def main() -> None:
     app.add_handler(ChatJoinRequestHandler(on_join_request))
     app.add_handler(CallbackQueryHandler(cb_stats, pattern="^stats$"))
 
-    # Callback handlers for subadmin permissions UI
     app.add_handler(CallbackQueryHandler(subadmin_list_callback, pattern="^perm_list$"))
     app.add_handler(CallbackQueryHandler(subadmin_perm_menu_callback, pattern="^perm_sub_"))
     app.add_handler(CallbackQueryHandler(perm_toggle_callback, pattern="^perm_toggle_"))
